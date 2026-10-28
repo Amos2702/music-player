@@ -186,11 +186,18 @@ h1 { font-family: var(--display); font-weight: 600; font-size: 28px; margin: 0; 
 .controls #bShuffle { font-size: 15px; }
 .vol { margin-left: 0; }
 .vol input { flex: 1; width: auto; }
-.pick { flex-wrap: nowrap; }
-.pick > * { flex: 1; text-align: center; white-space: nowrap; }
-.pick #bFavOnly { font-size: 15px; padding-inline: 8px; }
+.pick { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.pick > * { text-align: center; white-space: nowrap; min-width: 0; box-sizing: border-box; }
+.pick .filebtn { grid-column: 1 / -1; }
+.pick .ghost { font-size: 15px; padding-inline: 8px; }
 .playlist { flex: 1; min-height: 120px; max-height: none; }
 .playlist li { padding: 12px 4px; font-size: 16px; }
+.lyrics { flex: 1; min-height: 120px; overflow-y: auto; border-top: 1px solid var(--line); padding: 12px 4px 40vh; font-size: 19px; line-height: 1.6; white-space: pre-line; overflow-wrap: anywhere; }
+.lyrics p { margin: 0 0 10px; color: var(--muted); }
+.lyrics.plain p, .lyrics p.on { color: var(--ink); }
+.lyrics p.on { font-weight: 700; color: var(--accent); }
+.lyrics .empty { color: var(--muted); font-size: 16px; }
+@media (prefers-reduced-motion: no-preference) { .lyrics p { transition: color .2s; } }
 @media (min-width: 700px) { .wrap { max-width: 480px; } }
 </style>
 
@@ -217,9 +224,11 @@ h1 { font-family: var(--display); font-weight: 600; font-size: 28px; margin: 0; 
       <div class="pick">
         <label class="filebtn" for="songs">Choose songs<input type="file" id="songs" accept="audio/*,.mp3,.m4a,.aac,.wav,.flac" multiple></label>
         <button type="button" class="ghost" id="bFavOnly" aria-pressed="false">Favourites only</button>
+        <button type="button" class="ghost" id="bLyrics" aria-pressed="false">Lyrics</button>
       </div>
       <p class="runline" id="musicHint">Pick songs from Files or iCloud Drive (tap Select to choose several). Pick them again each visit; your ★ favourites are remembered.</p>
       <ol class="playlist" id="playlist"></ol>
+      <div class="lyrics" id="lyrics" hidden aria-live="off"></div>
       <audio id="audio" preload="metadata"></audio>
     </div>
   </section>
@@ -251,7 +260,7 @@ function playAt(p) {
   audio.dataset.url = URL.createObjectURL(s.file);
   audio.src = audio.dataset.url;
   audio.play().catch(() => {});
-  renderPlayer();
+  renderPlayer(); showLyrics();
 }
 function renderPlayer() {
   const cur = pos >= 0 ? songs[order[pos]] : null;
@@ -290,7 +299,7 @@ function loadSongs(fileList) {
   const files = [...fileList].filter(f => /^audio\//.test(f.type) || /\.(mp3|m4a|aac|wav|flac|ogg)$/i.test(f.name));
   if (!files.length) { $("musicHint").textContent = "No music files found there. Pick MP3 or other audio files."; return; }
   songs = files.map(f => ({ name: songName(f), file: f })).sort((a, b) => a.name.localeCompare(b.name));
-  audio.pause(); pos = -1; buildOrder(false); renderPlayer();
+  audio.pause(); pos = -1; buildOrder(false); renderPlayer(); showLyrics();
   const favFound = songs.filter(isFav).length;
   $("musicHint").textContent = songs.length + " songs loaded" + (music.favourites.length ? ", " + favFound + " of your " + music.favourites.length + " favourites among them." : ". Tap ☆ to star a favourite.");
 }
@@ -313,7 +322,101 @@ audio.addEventListener("timeupdate", () => {
   if (audio.duration) $("seek").value = Math.round(audio.currentTime / audio.duration * 1000);
 });
 $("seek").addEventListener("input", e => { if (audio.duration) audio.currentTime = e.target.value / 1000 * audio.duration; });
-function applyMusicSettings() { $("vol").value = music.volume; audio.volume = music.volume / 100; renderPlayer(); }
+
+// Lyrics come from the MP3's own ID3 tag: USLT (plain, or with [mm:ss] times) or SYLT (synced).
+function decodeText(b, enc) {
+  const label = ["windows-1252", "utf-16", "utf-16be", "utf-8"][enc] || "utf-8";
+  return new TextDecoder(label).decode(b).replace(/\u0000+$/, "").replace(/^﻿/, "");
+}
+function strEnd(b, i, enc) { // index of the terminator starting at i
+  if (enc === 1 || enc === 2) { for (; i + 1 < b.length; i += 2) if (!b[i] && !b[i + 1]) return i; return b.length; }
+  for (; i < b.length; i++) if (!b[i]) return i; return b.length;
+}
+const unsync = b => { const o = []; for (let i = 0; i < b.length; i++) { o.push(b[i]); if (b[i] === 0xff && b[i + 1] === 0) i++; } return new Uint8Array(o); };
+const syncsafe = (b, i) => (b[i] << 21) | (b[i + 1] << 14) | (b[i + 2] << 7) | b[i + 3];
+function parseLrc(text) {
+  const lines = [];
+  text.split(/\r?\n/).forEach(l => {
+    const times = [...l.matchAll(/\[(\d+):(\d+(?:[.:]\d+)?)\]/g)];
+    if (!times.length) return;
+    const t = l.replace(/\[[^\]]*\]/g, "").trim();
+    times.forEach(m => lines.push({ t: +m[1] * 60 + parseFloat(m[2].replace(":", ".")), text: t }));
+  });
+  return lines.length ? lines.sort((a, b) => a.t - b.t) : null;
+}
+async function readLyrics(file) {
+  const head = new Uint8Array(await file.slice(0, 10).arrayBuffer());
+  if (head[0] !== 0x49 || head[1] !== 0x44 || head[2] !== 0x33) return null; // "ID3"
+  const ver = head[3], flags = head[5];
+  let b = new Uint8Array(await file.slice(10, 10 + syncsafe(head, 6)).arrayBuffer());
+  if (ver < 4 && flags & 0x80) b = unsync(b);
+  let i = 0;
+  if (flags & 0x40) i = ver === 4 ? syncsafe(b, 0) : 4 + ((b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]);
+  const idLen = ver === 2 ? 3 : 4, hdr = ver === 2 ? 6 : 10;
+  let plain = null, synced = null;
+  while (i + hdr <= b.length && b[i]) {
+    const id = String.fromCharCode(...b.slice(i, i + idLen));
+    const size = ver === 2 ? (b[i + 3] << 16) | (b[i + 4] << 8) | b[i + 5]
+      : ver === 4 ? syncsafe(b, i + 4) : ((b[i + 4] << 24) | (b[i + 5] << 16) | (b[i + 6] << 8) | b[i + 7]) >>> 0;
+    if (size <= 0 || i + hdr + size > b.length) break;
+    let f = b.slice(i + hdr, i + hdr + size);
+    if (ver === 4 && b[i + 9] & 0x02) f = unsync(f);
+    if (ver === 4 && b[i + 9] & 0x01) f = f.slice(4);
+    const enc = f[0];
+    if ((id === "USLT" || id === "ULT") && !plain) {
+      let p = strEnd(f, 4, enc); p += enc === 1 || enc === 2 ? 2 : 1;
+      plain = decodeText(f.slice(p), enc).trim() || null;
+    } else if ((id === "SYLT" || id === "SLT") && !synced && f[4] === 2) { // timestamps in milliseconds
+      let p = strEnd(f, 6, enc) + (enc === 1 || enc === 2 ? 2 : 1); const lines = [];
+      while (p < f.length) {
+        const e = strEnd(f, p, enc), text = decodeText(f.slice(p, e), enc).replace(/^\n/, "");
+        p = e + (enc === 1 || enc === 2 ? 2 : 1);
+        if (p + 4 > f.length) break;
+        lines.push({ t: (((f[p] << 24) | (f[p + 1] << 16) | (f[p + 2] << 8) | f[p + 3]) >>> 0) / 1000, text: text.trim() });
+        p += 4;
+      }
+      if (lines.length) synced = lines;
+    }
+    i += hdr + size;
+  }
+  if (synced) return { synced: true, lines: synced };
+  if (!plain) return null;
+  const lrc = parseLrc(plain);
+  return lrc ? { synced: true, lines: lrc } : { synced: false, lines: plain.split(/\r?\n/).map(text => ({ text })) };
+}
+let lyricLine = -1;
+async function showLyrics() {
+  const box = $("lyrics"), on = !!music.showLyrics;
+  $("bLyrics").setAttribute("aria-pressed", String(on));
+  box.hidden = !on; $("playlist").hidden = on;
+  if (!on) return;
+  const cur = pos >= 0 ? songs[order[pos]] : null;
+  lyricLine = -1;
+  if (!cur) { box.replaceChildren(el("p", "empty", "Play a song to see its lyrics.")); return; }
+  if (cur.lyrics === undefined) {
+    box.replaceChildren(el("p", "empty", "Looking for lyrics…"));
+    try { cur.lyrics = await readLyrics(cur.file); } catch (e) { cur.lyrics = null; }
+    if (cur !== (pos >= 0 ? songs[order[pos]] : null) || !music.showLyrics) return; // song changed meanwhile
+  }
+  if (!cur.lyrics) { box.replaceChildren(el("p", "empty", "This song file has no lyrics saved inside it.")); return; }
+  box.className = "lyrics" + (cur.lyrics.synced ? "" : " plain");
+  box.replaceChildren(...cur.lyrics.lines.map(l => el("p", "", l.text || " ")));
+  box.scrollTop = 0; syncLyrics();
+}
+function syncLyrics() {
+  const cur = pos >= 0 ? songs[order[pos]] : null, box = $("lyrics");
+  if (!music.showLyrics || !cur || !cur.lyrics || !cur.lyrics.synced) return;
+  let n = -1; cur.lyrics.lines.forEach((l, k) => { if (l.t <= audio.currentTime + 0.2) n = k; });
+  if (n === lyricLine) return;
+  const ps = box.children;
+  if (ps[lyricLine]) ps[lyricLine].classList.remove("on");
+  lyricLine = n;
+  if (ps[n]) { ps[n].classList.add("on"); box.scrollTo({ top: ps[n].offsetTop - box.offsetTop - box.clientHeight / 3, behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" }); }
+}
+$("bLyrics").addEventListener("click", () => { music.showLyrics = !music.showLyrics; showLyrics(); saveMusic().catch(() => {}); });
+audio.addEventListener("timeupdate", syncLyrics);
+audio.addEventListener("seeked", syncLyrics);
+function applyMusicSettings() { $("vol").value = music.volume; audio.volume = music.volume / 100; renderPlayer(); showLyrics(); }
 try { const m = JSON.parse(localStorage.getItem("music") || "null"); if (m) music = Object.assign(music, m); } catch (e) {}
 applyMusicSettings();
 </script>
