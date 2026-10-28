@@ -384,6 +384,36 @@ async function readLyrics(file) {
   const lrc = parseLrc(plain);
   return lrc ? { synced: true, lines: lrc } : { synced: false, lines: plain.split(/\r?\n/).map(text => ({ text })) };
 }
+// Fallback: look the song up on LRCLIB (free, no key) by a cleaned-up file name. Found lyrics are kept on this device.
+const NOISE = /official|music\s*video|lyrics?|lyric\s*video|\bmv\b|\bm\/v\b|audio|\bhd\b|\bhq\b|4k|1080p|720p|kbps|karaoke|ktv|visuali[sz]er|官方|歌词|歌詞|动态|動態|完整版|高音质|高音質|高清|字幕|无损|無損|伴奏|純音樂|纯音乐/i;
+function cleanName(n) {
+  let t = n.replace(/[\(\[（【《「『<][^\)\]）】》」』>]*[\)\]）】》」』>]/g, m => NOISE.test(m) ? " " : " " + m.slice(1, -1) + " ");
+  t = t.replace(/\b(official\s+(music\s+)?video|official\s+mv|lyric\s+video|with\s+lyrics|lyrics|audio|mv)\b/gi, " ");
+  t = t.replace(/(动态|動態)?(歌词|歌詞)(版)?|官方(完整)?(版)?|完整版|高音质|高音質|高清|无损|無損/g, " ");
+  return t.replace(/[_|｜]+/g, " ").replace(/\s*[-–—]\s*/g, " ").replace(/\s+/g, " ").trim();
+}
+async function lrclib(q) {
+  const r = await fetch("https://lrclib.net/api/search?q=" + encodeURIComponent(q));
+  if (!r.ok) throw new Error("lrclib " + r.status);
+  return r.json();
+}
+async function onlineLyrics(s) {
+  const key = "lyr:" + s.name;
+  try { const c = JSON.parse(localStorage.getItem(key) || "null"); if (c) return c; } catch (e) {}
+  const q1 = cleanName(s.name), q2 = s.name.replace(/[\(\[（【《「『<][^\)\]）】》」』>]*[\)\]）】》」』>]/g, " ").replace(/[-–—_|]+/g, " ").replace(/\s+/g, " ").trim();
+  let res = q1 ? await lrclib(q1) : [];
+  if (!res.length && q2 && q2 !== q1) res = await lrclib(q2);
+  const q3 = (q1.match(/[\u3400-\u9fff\uf900-\ufaff]+/g) || []).join(" "); // Chinese words only, for mixed titles
+  if (!res.length && q3 && q3 !== q1) res = await lrclib(q3);
+  res = res.filter(x => !x.instrumental && (x.syncedLyrics || x.plainLyrics));
+  if (!res.length) return null;
+  const d = audio.duration, near = x => isFinite(d) && x.duration && Math.abs(x.duration - d) < 12;
+  const best = res.find(x => near(x) && x.syncedLyrics) || res.find(near) || res.find(x => x.syncedLyrics) || res[0];
+  const lrc = best.syncedLyrics && parseLrc(best.syncedLyrics);
+  const out = { synced: !!lrc, lines: lrc || best.plainLyrics.split(/\r?\n/).map(text => ({ text })), source: best.artistName + " – " + best.trackName };
+  try { localStorage.setItem(key, JSON.stringify(out)); } catch (e) {}
+  return out;
+}
 let lyricLine = -1;
 async function showLyrics() {
   const box = $("lyrics"), on = !!music.showLyrics;
@@ -396,11 +426,17 @@ async function showLyrics() {
   if (cur.lyrics === undefined) {
     box.replaceChildren(el("p", "empty", "Looking for lyrics…"));
     try { cur.lyrics = await readLyrics(cur.file); } catch (e) { cur.lyrics = null; }
+    if (!cur.lyrics) {
+      box.replaceChildren(el("p", "empty", "Searching online for lyrics…"));
+      try { cur.lyrics = await onlineLyrics(cur); } catch (e) { cur.lyrics = undefined; }
+    }
     if (cur !== (pos >= 0 ? songs[order[pos]] : null) || !music.showLyrics) return; // song changed meanwhile
   }
-  if (!cur.lyrics) { box.replaceChildren(el("p", "empty", "This song file has no lyrics saved inside it.")); return; }
+  if (cur.lyrics === undefined) { box.replaceChildren(el("p", "empty", "Couldn't reach the lyrics site. Check your internet, then tap Lyrics again.")); return; }
+  if (!cur.lyrics) { box.replaceChildren(el("p", "empty", "No lyrics found for this song. Lyrics are found more often when the file name has the song title and singer.")); return; }
   box.className = "lyrics" + (cur.lyrics.synced ? "" : " plain");
   box.replaceChildren(...cur.lyrics.lines.map(l => el("p", "", l.text || " ")));
+  if (cur.lyrics.source) box.append(el("p", "empty", "Lyrics found online: " + cur.lyrics.source + ". If this is the wrong song, rename the file to include the title and singer."));
   box.scrollTop = 0; syncLyrics();
 }
 function syncLyrics() {
