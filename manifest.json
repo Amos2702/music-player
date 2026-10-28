@@ -1,6 +1,6 @@
 {
-  "name": "Music Player",
-  "short_name": "Music",
+  "name": "MyMusic",
+  "short_name": "MyMusic",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
