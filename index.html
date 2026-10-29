@@ -190,8 +190,26 @@ h1 { font-family: var(--display); font-weight: 600; font-size: 28px; margin: 0; 
 .controls .ghost[aria-pressed="true"], .volrow .ghost[aria-pressed="true"] { background: var(--accent); color: var(--surface); }
 .vol input { flex: 1; width: auto; }
 .pick { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-.pick > * { text-align: center; white-space: nowrap; min-width: 0; box-sizing: border-box; }
-.pick .filebtn { grid-column: 1 / -1; }
+.pick > * { text-align: center; white-space: nowrap; min-width: 0; box-sizing: border-box; overflow: hidden; text-overflow: ellipsis; }
+.lists { flex: 1; min-height: 120px; overflow-y: auto; border-top: 1px solid var(--line); display: flex; flex-direction: column; }
+.lists[hidden], .sheet[hidden] { display: none; }
+.lrow { display: flex; gap: 8px; align-items: center; padding: 10px 4px; border-bottom: 1px solid var(--line); }
+.lrow .lname { flex: 1; min-width: 0; overflow-wrap: anywhere; cursor: pointer; font-size: 16px; }
+.lrow .lname small { color: var(--muted); font-size: 13px; margin-left: 6px; }
+.lrow.cur { background: var(--accent-soft); }
+.lrow.cur .lname { color: var(--accent); font-weight: 700; }
+.lrow button { font-size: 13px; padding: 5px 10px; flex: none; }
+.lrow input, .newlist input { font: inherit; font-size: 16px; padding: 7px 10px; border-radius: 10px; border: 1px solid var(--line); background: var(--surface); color: var(--ink); min-width: 0; flex: 1; }
+.newlist { display: flex; gap: 8px; padding: 12px 4px; }
+.newlist button { font-size: 15px; padding: 7px 14px; }
+.lhint { color: var(--muted); font-size: 14px; padding: 8px 4px; margin: 0; }
+.playlist .add { font-size: 20px; padding: 0 10px; border: 0; background: transparent; color: var(--accent); cursor: pointer; flex: none; }
+.sheet { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: flex; align-items: flex-end; justify-content: center; z-index: 10; }
+.sheet-box { background: var(--surface); border: 1px solid var(--line); border-radius: 16px 16px 0 0; padding: 18px 16px calc(18px + env(safe-area-inset-bottom, 0px)); width: 100%; max-width: 480px; max-height: 75vh; overflow-y: auto; box-sizing: border-box; display: flex; flex-direction: column; gap: 10px; }
+.sheet-title { margin: 0; font-weight: 700; overflow-wrap: anywhere; }
+.sheet-opts { display: flex; flex-direction: column; gap: 8px; }
+.sheet-opts button { text-align: left; font-size: 16px; }
+.sheet .newlist { padding: 0; }
 .pick .ghost { font-size: 15px; padding-inline: 8px; }
 .playlist { flex: 1; min-height: 120px; max-height: none; }
 .playlist li { padding: 12px 4px; font-size: 16px; }
@@ -234,11 +252,13 @@ h1 { font-family: var(--display); font-weight: 600; font-size: 28px; margin: 0; 
       </div>
       <div class="pick">
         <label class="filebtn" for="songs">Choose songs<input type="file" id="songs" accept="audio/*,.mp3,.m4a,.aac,.wav,.flac" multiple></label>
+        <button type="button" class="ghost" id="bLists" aria-pressed="false">Playlists</button>
         <button type="button" class="ghost" id="bFavOnly" aria-pressed="false">Favourites only</button>
         <button type="button" class="ghost" id="bLyrics" aria-pressed="false">Lyrics</button>
       </div>
       <p class="runline" id="musicHint">Pick songs from Files or iCloud Drive (tap Select to choose several). Pick them again each visit; your ★ favourites are remembered.</p>
       <ol class="playlist" id="playlist"></ol>
+      <div class="lists" id="lists" hidden></div>
       <div class="lyrics" id="lyrics" hidden aria-live="off"></div>
       <div class="lyrsync" id="lyrSync" hidden>
         <button type="button" class="ghost" id="bLyrEarlier">◀ Lyrics earlier</button>
@@ -246,6 +266,12 @@ h1 { font-family: var(--display); font-weight: 600; font-size: 28px; margin: 0; 
         <button type="button" class="ghost" id="bLyrLater">Lyrics later ▶</button>
       </div>
       <audio id="audio" preload="metadata"></audio>
+      <div class="sheet" id="sheet" hidden role="dialog" aria-modal="true" aria-labelledby="sheetTitle"><div class="sheet-box">
+        <p class="sheet-title" id="sheetTitle"></p>
+        <div class="sheet-opts" id="sheetOpts"></div>
+        <form class="newlist" id="sheetNew"><input id="sheetName" placeholder="New playlist name" maxlength="40" aria-label="New playlist name"><button type="submit" class="ghost">Add</button></form>
+        <button type="button" id="sheetDone">Done</button>
+      </div></div>
     </div>
   </section>
 </div>
@@ -254,16 +280,19 @@ h1 { font-family: var(--display); font-weight: 600; font-size: 28px; margin: 0; 
 const $ = id => document.getElementById(id);
 function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
 // Files are picked each visit (browsers can't keep them); favourites and settings stay on this device.
-let music = { favourites: [], volume: 80, shuffle: false, favOnly: false };
+let music = { favourites: [], volume: 80, shuffle: false, favOnly: false, playlists: {}, active: null };
 let saveMusic = async () => { try { localStorage.setItem("music", JSON.stringify(music)); } catch (e) {} };
 let songs = [], order = [], pos = -1;
 const audio = $("audio");
 const songName = f => f.name.replace(/\.[^.]+$/, "");
 const fmtClock = s => !isFinite(s) ? "0:00" : Math.floor(s / 60) + ":" + String(Math.floor(s % 60)).padStart(2, "0");
 const isFav = s => music.favourites.includes(s.name);
+// Named playlists hold song names only; the active one filters the songs picked this visit.
+const inActive = s => !music.active || (music.playlists[music.active] || []).includes(s.name);
+let listsOpen = false;
 function buildOrder(keepCurrent) {
   const cur = pos >= 0 ? order[pos] : null;
-  let idx = songs.map((_, i) => i).filter(i => !music.favOnly || isFav(songs[i]));
+  let idx = songs.map((_, i) => i).filter(i => (!music.favOnly || isFav(songs[i])) && inActive(songs[i]));
   if (music.shuffle) for (let i = idx.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [idx[i], idx[j]] = [idx[j], idx[i]]; }
   order = idx;
   pos = keepCurrent && cur != null ? order.indexOf(cur) : -1;
@@ -281,7 +310,7 @@ function playAt(p) {
 function renderPlayer() {
   const cur = pos >= 0 ? songs[order[pos]] : null;
   $("npTitle").textContent = cur ? cur.name : "No song playing";
-  $("npMeta").textContent = cur ? "Song " + (pos + 1) + " of " + order.length + (music.favOnly ? " favourites" : "") + (isFav(cur) ? " · ★ favourite" : "")
+  $("npMeta").textContent = cur ? "Song " + (pos + 1) + " of " + order.length + (music.favOnly ? " favourites" : "") + (music.active ? " in “" + music.active + "”" : "") + (isFav(cur) ? " · ★ favourite" : "")
     : songs.length ? songs.length + " songs loaded. Press play or tap a song." : "Choose songs from your iCloud Drive or Music folder to start.";
   $("bPlay").textContent = audio.paused ? "▶" : "❚❚";
   $("bPlay").setAttribute("aria-label", audio.paused ? "Play" : "Pause");
@@ -305,8 +334,14 @@ function renderPlayer() {
       renderPlayer(); saveMusic().catch(() => {});
     });
     const name = el("span", "name", s.name);
-    name.addEventListener("click", () => { if (music.favOnly && !isFav(s)) { music.favOnly = false; buildOrder(false); } playAt(order.indexOf(i)); });
-    li.append(star, name); frag.append(li);
+    name.addEventListener("click", () => {
+      if ((music.favOnly && !isFav(s)) || !inActive(s)) { music.favOnly = false; music.active = null; buildOrder(false); }
+      playAt(order.indexOf(i));
+    });
+    const add = el("button", "add", "＋"); add.type = "button";
+    add.setAttribute("aria-label", "Add to a playlist: " + s.name);
+    add.addEventListener("click", () => openSheet(s.name));
+    li.append(star, name, add); frag.append(li);
   });
   ol.append(frag);
   if (songs.length > 1000) ol.append(el("li", "runline", (songs.length - 1000) + " more songs are loaded and will play, but aren't listed."));
@@ -328,6 +363,97 @@ $("bNext").addEventListener("click", () => playAt(pos + 1));
 $("bPrev").addEventListener("click", () => { if (audio.currentTime > 3) audio.currentTime = 0; else playAt(pos - 1); });
 $("bShuffle").addEventListener("click", () => { music.shuffle = !music.shuffle; buildOrder(true); renderPlayer(); saveMusic().catch(() => {}); });
 $("bFavOnly").addEventListener("click", () => { music.favOnly = !music.favOnly; buildOrder(true); renderPlayer(); saveMusic().catch(() => {}); });
+function setActive(name) {
+  music.active = name; if (name) music.favOnly = false;
+  buildOrder(false); listsOpen = false; renderPlayer(); showLyrics(); showView(); saveMusic().catch(() => {});
+  if (order.length) playAt(0);
+  else $("musicHint").textContent = name && songs.length ? "None of the songs you picked are in “" + name + "”." : name ? "Tap Choose songs first, then the playlist plays its songs." : $("musicHint").textContent;
+}
+function renderLists() {
+  const box = $("lists"); box.replaceChildren();
+  const row = (label, count, isCur, onPick) => {
+    const r = el("div", "lrow" + (isCur ? " cur" : "")), n = el("span", "lname", label);
+    if (count != null) n.append(el("small", "", count + (count === 1 ? " song" : " songs")));
+    n.setAttribute("role", "button"); n.tabIndex = 0;
+    n.addEventListener("click", onPick); n.addEventListener("keydown", e => { if (e.key === "Enter") onPick(); });
+    r.append(n); box.append(r); return r;
+  };
+  row("All songs", null, !music.active && !music.favOnly, () => { music.favOnly = false; setActive(null); });
+  Object.keys(music.playlists).sort((a, b) => a.localeCompare(b)).forEach(name => {
+    const r = row(name, music.playlists[name].length, music.active === name, () => setActive(name));
+    const ren = el("button", "ghost", "Rename"); ren.type = "button";
+    ren.addEventListener("click", () => {
+      const inp = el("input"); inp.value = name; inp.maxLength = 40; inp.setAttribute("aria-label", "New name for " + name);
+      const ok = el("button", "", "Save"); ok.type = "button";
+      const save = () => {
+        const nn = inp.value.trim();
+        if (nn && nn !== name && !music.playlists[nn]) {
+          music.playlists[nn] = music.playlists[name]; delete music.playlists[name];
+          if (music.active === name) music.active = nn;
+          saveMusic().catch(() => {});
+        }
+        showView(); renderPlayer();
+      };
+      ok.addEventListener("click", save); inp.addEventListener("keydown", e => { if (e.key === "Enter") save(); });
+      r.replaceChildren(inp, ok); inp.focus();
+    });
+    const del = el("button", "danger", "Delete"); del.type = "button";
+    del.addEventListener("click", () => {
+      if (del.dataset.armed) {
+        delete music.playlists[name];
+        if (music.active === name) { music.active = null; buildOrder(true); }
+        saveMusic().catch(() => {}); showView(); renderPlayer();
+      } else { del.dataset.armed = "1"; del.textContent = "Tap to confirm"; }
+    });
+    r.append(ren, del);
+  });
+  const f = el("form", "newlist"), inp = el("input"), b = el("button", "ghost", "Create");
+  inp.placeholder = "New playlist name"; inp.maxLength = 40; inp.setAttribute("aria-label", "New playlist name"); b.type = "submit";
+  f.append(inp, b);
+  f.addEventListener("submit", e => {
+    e.preventDefault(); const n = inp.value.trim();
+    if (n && !music.playlists[n]) { music.playlists[n] = []; saveMusic().catch(() => {}); renderLists(); }
+  });
+  box.append(f, el("p", "lhint", "To add songs, close this and tap ＋ next to a song in the list."));
+}
+function showView() {
+  $("bLists").setAttribute("aria-pressed", String(listsOpen));
+  $("bLists").textContent = music.active ? "▶ " + music.active : "Playlists";
+  $("lists").hidden = !listsOpen;
+  if (listsOpen) { $("playlist").hidden = true; $("lyrics").hidden = true; $("lyrSync").hidden = true; renderLists(); }
+}
+$("bLists").addEventListener("click", () => {
+  listsOpen = !listsOpen;
+  if (listsOpen && music.showLyrics) { music.showLyrics = false; saveMusic().catch(() => {}); }
+  showLyrics(); showView();
+});
+let sheetSong = null;
+function renderSheet() {
+  $("sheetTitle").textContent = "Add “" + sheetSong + "” to:";
+  const opts = $("sheetOpts"); opts.replaceChildren();
+  const names = Object.keys(music.playlists).sort((a, b) => a.localeCompare(b));
+  if (!names.length) opts.append(el("p", "lhint", "No playlists yet. Type a name below and tap Add."));
+  names.forEach(n => {
+    const has = music.playlists[n].includes(sheetSong);
+    const b = el("button", has ? "" : "ghost", (has ? "✓ " : "＋ ") + n); b.type = "button"; b.setAttribute("aria-pressed", String(has));
+    b.addEventListener("click", () => {
+      music.playlists[n] = has ? music.playlists[n].filter(x => x !== sheetSong) : [...music.playlists[n], sheetSong];
+      if (music.active === n) buildOrder(true);
+      saveMusic().catch(() => {}); renderSheet(); renderPlayer();
+    });
+    opts.append(b);
+  });
+}
+function openSheet(name) { sheetSong = name; $("sheetName").value = ""; renderSheet(); $("sheet").hidden = false; }
+function closeSheet() { $("sheet").hidden = true; sheetSong = null; }
+$("sheetDone").addEventListener("click", closeSheet);
+$("sheet").addEventListener("click", e => { if (e.target === $("sheet")) closeSheet(); });
+$("sheetNew").addEventListener("submit", e => {
+  e.preventDefault(); const n = $("sheetName").value.trim(); if (!n) return;
+  music.playlists[n] = [...new Set([...(music.playlists[n] || []), sheetSong])];
+  if (music.active === n) buildOrder(true);
+  $("sheetName").value = ""; saveMusic().catch(() => {}); renderSheet(); renderPlayer();
+});
 $("vol").addEventListener("input", e => { audio.volume = e.target.value / 100; music.volume = +e.target.value; });
 $("vol").addEventListener("change", () => saveMusic().catch(() => {}));
 audio.addEventListener("ended", () => playAt(pos + 1));
@@ -449,8 +575,8 @@ $("bLyrLater").addEventListener("click", () => shiftLyrics(0.5));
 async function showLyrics() {
   const box = $("lyrics"), on = !!music.showLyrics;
   $("bLyrics").setAttribute("aria-pressed", String(on));
-  box.hidden = !on; $("playlist").hidden = on; $("lyrSync").hidden = true;
-  if (!on) return;
+  box.hidden = !on || listsOpen; $("playlist").hidden = on || listsOpen; $("lyrSync").hidden = true;
+  if (!on || listsOpen) return;
   const cur = pos >= 0 ? songs[order[pos]] : null;
   lyricLine = -1;
   if (!cur) { box.replaceChildren(el("p", "empty", "Play a song to see its lyrics.")); return; }
@@ -482,7 +608,7 @@ function syncLyrics() {
   lyricLine = n;
   if (ps[n]) { ps[n].classList.add("on"); box.scrollTo({ top: ps[n].offsetTop - box.offsetTop - box.clientHeight / 3, behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" }); }
 }
-$("bLyrics").addEventListener("click", () => { music.showLyrics = !music.showLyrics; showLyrics(); saveMusic().catch(() => {}); });
+$("bLyrics").addEventListener("click", () => { music.showLyrics = !music.showLyrics; listsOpen = false; showLyrics(); showView(); saveMusic().catch(() => {}); });
 audio.addEventListener("timeupdate", syncLyrics);
 audio.addEventListener("seeked", syncLyrics);
 // Karaoke: cancel what's mixed in the centre (usually the lead vocal) by subtracting right from left,
@@ -513,7 +639,7 @@ function setKaraoke(on) {
 }
 $("bKaraoke").addEventListener("click", () => setKaraoke(!(kar && kar.on)));
 audio.addEventListener("play", () => { if (kar) kar.ctx.resume().catch(() => {}); });
-function applyMusicSettings() { $("vol").value = music.volume; audio.volume = music.volume / 100; renderPlayer(); showLyrics(); }
+function applyMusicSettings() { $("vol").value = music.volume; audio.volume = music.volume / 100; renderPlayer(); showLyrics(); showView(); }
 try { const m = JSON.parse(localStorage.getItem("music") || "null"); if (m) music = Object.assign(music, m); } catch (e) {}
 applyMusicSettings();
 </script>
