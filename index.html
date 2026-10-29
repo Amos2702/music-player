@@ -184,7 +184,10 @@ h1 { font-family: var(--display); font-weight: 600; font-size: 28px; margin: 0; 
 .controls { flex-wrap: nowrap; }
 .controls button { flex: 1; font-size: 22px; padding: 14px 0; }
 .controls #bShuffle { font-size: 15px; }
-.vol { margin-left: 0; }
+.vol { margin-left: 0; flex: 1; }
+.volrow { display: flex; gap: 12px; align-items: center; }
+.volrow #bKaraoke { font-size: 15px; padding: 8px 14px; flex: none; }
+.controls .ghost[aria-pressed="true"], .volrow .ghost[aria-pressed="true"] { background: var(--accent); color: var(--surface); }
 .vol input { flex: 1; width: auto; }
 .pick { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .pick > * { text-align: center; white-space: nowrap; min-width: 0; box-sizing: border-box; }
@@ -225,7 +228,10 @@ h1 { font-family: var(--display); font-weight: 600; font-size: 28px; margin: 0; 
         <button type="button" class="ghost" id="bNext" aria-label="Next song">⏭</button>
         <button type="button" class="ghost" id="bShuffle" aria-pressed="false">Shuffle</button>
       </div>
-      <label class="vol">Volume <input type="range" id="vol" min="0" max="100" value="80" aria-label="Volume"></label>
+      <div class="volrow">
+        <label class="vol">Volume <input type="range" id="vol" min="0" max="100" value="80" aria-label="Volume"></label>
+        <button type="button" class="ghost" id="bKaraoke" aria-pressed="false">Karaoke</button>
+      </div>
       <div class="pick">
         <label class="filebtn" for="songs">Choose songs<input type="file" id="songs" accept="audio/*,.mp3,.m4a,.aac,.wav,.flac" multiple></label>
         <button type="button" class="ghost" id="bFavOnly" aria-pressed="false">Favourites only</button>
@@ -479,6 +485,34 @@ function syncLyrics() {
 $("bLyrics").addEventListener("click", () => { music.showLyrics = !music.showLyrics; showLyrics(); saveMusic().catch(() => {}); });
 audio.addEventListener("timeupdate", syncLyrics);
 audio.addEventListener("seeked", syncLyrics);
+// Karaoke: cancel what's mixed in the centre (usually the lead vocal) by subtracting right from left,
+// then add back some low bass, which also sits in the centre. Web Audio starts only on first use.
+let kar = null;
+function setupKaraoke() {
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const src = ctx.createMediaElementSource(audio);
+  const dry = ctx.createGain(), wet = ctx.createGain(); wet.gain.value = 0;
+  const split = ctx.createChannelSplitter(2), inv = ctx.createGain(), diff = ctx.createGain();
+  inv.gain.value = -1; diff.channelCount = 1; diff.channelCountMode = "explicit";
+  const bass = ctx.createBiquadFilter(); bass.type = "lowpass"; bass.frequency.value = 140;
+  const bassGain = ctx.createGain(); bassGain.gain.value = 0.8;
+  src.connect(dry).connect(ctx.destination);
+  src.connect(split); split.connect(diff, 0); split.connect(inv, 1).connect(diff);
+  diff.connect(wet); src.connect(bass).connect(bassGain).connect(wet);
+  wet.connect(ctx.destination);
+  return { ctx, dry, wet, on: false };
+}
+function setKaraoke(on) {
+  if (!kar) { try { kar = setupKaraoke(); } catch (e) { $("musicHint").textContent = "Karaoke isn't supported in this browser."; return; } }
+  kar.on = on; kar.ctx.resume().catch(() => {});
+  const t = kar.ctx.currentTime;
+  kar.dry.gain.setTargetAtTime(on ? 0 : 1, t, 0.05);
+  kar.wet.gain.setTargetAtTime(on ? 1 : 0, t, 0.05);
+  $("bKaraoke").setAttribute("aria-pressed", String(on));
+  $("bKaraoke").textContent = on ? "Karaoke on" : "Karaoke";
+}
+$("bKaraoke").addEventListener("click", () => setKaraoke(!(kar && kar.on)));
+audio.addEventListener("play", () => { if (kar) kar.ctx.resume().catch(() => {}); });
 function applyMusicSettings() { $("vol").value = music.volume; audio.volume = music.volume / 100; renderPlayer(); showLyrics(); }
 try { const m = JSON.parse(localStorage.getItem("music") || "null"); if (m) music = Object.assign(music, m); } catch (e) {}
 applyMusicSettings();
