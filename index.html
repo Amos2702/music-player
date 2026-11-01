@@ -256,7 +256,7 @@ h1 { font-family: var(--display); font-weight: 600; font-size: 28px; margin: 0; 
         <button type="button" class="ghost" id="bFavOnly" aria-pressed="false">Favourites only</button>
         <button type="button" class="ghost" id="bLyrics" aria-pressed="false">Lyrics</button>
       </div>
-      <p class="runline" id="musicHint">Pick songs from Files or iCloud Drive (tap Select to choose several). Pick them again each visit; your ★ favourites are remembered.</p>
+      <p class="runline" id="musicHint">Loading your library…</p>
       <ol class="playlist" id="playlist"></ol>
       <div class="lists" id="lists" hidden></div>
       <div class="lyrics" id="lyrics" hidden aria-live="off"></div>
@@ -270,6 +270,7 @@ h1 { font-family: var(--display); font-weight: 600; font-size: 28px; margin: 0; 
         <p class="sheet-title" id="sheetTitle"></p>
         <div class="sheet-opts" id="sheetOpts"></div>
         <form class="newlist" id="sheetNew"><input id="sheetName" placeholder="New playlist name" maxlength="40" aria-label="New playlist name"><button type="submit" class="ghost">Add</button></form>
+        <button type="button" class="danger" id="sheetRemove">Remove from library</button>
         <button type="button" id="sheetDone">Done</button>
       </div></div>
     </div>
@@ -279,7 +280,8 @@ h1 { font-family: var(--display); font-weight: 600; font-size: 28px; margin: 0; 
 <script>
 const $ = id => document.getElementById(id);
 function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
-// Files are picked each visit (browsers can't keep them); favourites and settings stay on this device.
+// Songs are copied into this app's IndexedDB storage when picked, so they load by themselves next time.
+// Favourites, playlists and settings stay in localStorage, keyed by song name.
 let music = { favourites: [], volume: 80, shuffle: false, favOnly: false, playlists: {}, active: null };
 let saveMusic = async () => { try { localStorage.setItem("music", JSON.stringify(music)); } catch (e) {} };
 let songs = [], order = [], pos = -1;
@@ -290,6 +292,63 @@ const isFav = s => music.favourites.includes(s.name);
 // Named playlists hold song names only; the active one filters the songs picked this visit.
 const inActive = s => !music.active || (music.playlists[music.active] || []).includes(s.name);
 let listsOpen = false;
+// Song library: one IndexedDB record per song { id: "file name|size", name, size, blob, added }.
+let storageOK = "indexedDB" in window;
+const DB = new Promise((res, rej) => {
+  if (!storageOK) return rej(new Error("no IndexedDB"));
+  const r = indexedDB.open("mymusic", 1);
+  r.onupgradeneeded = () => r.result.createObjectStore("songs", { keyPath: "id" });
+  r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); r.onblocked = () => rej(new Error("blocked"));
+});
+function idb(mode, fn) {
+  return DB.then(db => new Promise((res, rej) => {
+    const tx = db.transaction("songs", mode); let out;
+    const q = fn(tx.objectStore("songs")); if (q) q.onsuccess = () => { out = q.result; };
+    tx.oncomplete = () => res(out); tx.onerror = tx.onabort = () => rej(tx.error || new Error("storage error"));
+  }));
+}
+const MIME = { mp3: "audio/mpeg", m4a: "audio/mp4", aac: "audio/aac", wav: "audio/wav", flac: "audio/flac", ogg: "audio/ogg" };
+const mimeOf = f => f.type || MIME[(f.name.match(/\.(\w+)$/) || [])[1]?.toLowerCase()] || "audio/mpeg";
+const fmtSize = n => n >= 1e9 ? (n / 1e9).toFixed(1) + " GB" : Math.round(n / 1e6) + " MB";
+const librarySize = () => songs.reduce((t, s) => t + (s.size || 0), 0);
+// Replace the song list, keeping the current song playing and its place in the order.
+function setSongs(list) {
+  const cur = pos >= 0 ? songs[order[pos]] : null;
+  songs = list.sort((a, b) => a.name.localeCompare(b.name));
+  buildOrder(false);
+  pos = cur ? order.indexOf(songs.indexOf(cur)) : -1;
+  renderPlayer(); if (listsOpen) renderLists();
+}
+function stopPlayback() {
+  audio.pause(); audio.removeAttribute("src"); audio.load();
+  if (audio.dataset.url) { URL.revokeObjectURL(audio.dataset.url); delete audio.dataset.url; }
+  $("tCur").textContent = "0:00"; $("tDur").textContent = "0:00"; $("seek").value = 0;
+}
+async function loadLibrary() {
+  try {
+    const recs = await idb("readonly", st => st.getAll());
+    setSongs(recs.map(r => ({ id: r.id, name: r.name, size: r.size, file: r.blob })));
+    $("musicHint").textContent = songs.length
+      ? songs.length + " songs in your library (" + fmtSize(librarySize()) + "). Tap Choose songs to add more."
+      : "Tap Choose songs to add music from Files or iCloud Drive. Songs are saved in this app, so you only add them once.";
+  } catch (e) {
+    storageOK = false;
+    $("musicHint").textContent = "Couldn't open this phone's song storage, so songs won't be saved. Pick songs each visit.";
+  }
+}
+async function removeSong(s) {
+  try { if (storageOK) await idb("readwrite", st => { st.delete(s.id); }); }
+  catch (e) { $("musicHint").textContent = "Couldn't remove “" + s.name + "”. Try again."; return; }
+  if (pos >= 0 && songs[order[pos]] === s) stopPlayback();
+  setSongs(songs.filter(x => x !== s)); showLyrics();
+  $("musicHint").textContent = "Removed “" + s.name + "” from your library. " + songs.length + " songs left.";
+}
+async function clearLibrary() {
+  try { if (storageOK) await idb("readwrite", st => { st.clear(); }); }
+  catch (e) { $("musicHint").textContent = "Couldn't clear the library. Try again."; return; }
+  stopPlayback(); setSongs([]); showLyrics();
+  $("musicHint").textContent = "Library cleared. Your original files in Files and iCloud Drive are untouched.";
+}
 function buildOrder(keepCurrent) {
   const cur = pos >= 0 ? order[pos] : null;
   let idx = songs.map((_, i) => i).filter(i => (!music.favOnly || isFav(songs[i])) && inActive(songs[i]));
@@ -311,7 +370,7 @@ function renderPlayer() {
   const cur = pos >= 0 ? songs[order[pos]] : null;
   $("npTitle").textContent = cur ? cur.name : "No song playing";
   $("npMeta").textContent = cur ? "Song " + (pos + 1) + " of " + order.length + (music.favOnly ? " favourites" : "") + (music.active ? " in “" + music.active + "”" : "") + (isFav(cur) ? " · ★ favourite" : "")
-    : songs.length ? songs.length + " songs loaded. Press play or tap a song." : "Choose songs from your iCloud Drive or Music folder to start.";
+    : songs.length ? songs.length + " songs in your library. Press play or tap a song." : "Choose songs from your iCloud Drive or Music folder to start.";
   $("bPlay").textContent = audio.paused ? "▶" : "❚❚";
   $("bPlay").setAttribute("aria-label", audio.paused ? "Play" : "Pause");
   $("bShuffle").setAttribute("aria-pressed", String(music.shuffle));
@@ -340,21 +399,47 @@ function renderPlayer() {
     });
     const add = el("button", "add", "＋"); add.type = "button";
     add.setAttribute("aria-label", "Add to a playlist: " + s.name);
-    add.addEventListener("click", () => openSheet(s.name));
+    add.setAttribute("aria-label", "Playlists or remove: " + s.name);
+    add.addEventListener("click", () => openSheet(s));
     li.append(star, name, add); frag.append(li);
   });
   ol.append(frag);
   if (songs.length > 1000) ol.append(el("li", "runline", (songs.length - 1000) + " more songs are loaded and will play, but aren't listed."));
 }
-function loadSongs(fileList) {
+// Picked songs are added to the library (not replacing it). Same name and size counts as already added.
+let importing = false;
+async function importSongs(fileList) {
   const files = [...fileList].filter(f => /^audio\//.test(f.type) || /\.(mp3|m4a|aac|wav|flac|ogg)$/i.test(f.name));
   if (!files.length) { $("musicHint").textContent = "No music files found there. Pick MP3 or other audio files."; return; }
-  songs = files.map(f => ({ name: songName(f), file: f })).sort((a, b) => a.name.localeCompare(b.name));
-  audio.pause(); pos = -1; buildOrder(false); renderPlayer(); showLyrics();
+  if (importing) return;
+  importing = true;
+  if (storageOK && navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+  const have = new Set(songs.map(s => s.id));
+  let fresh = [], added = 0, skipped = 0, failed = 0, full = false;
+  for (let k = 0; k < files.length; k++) {
+    const f = files[k], id = f.name + "|" + f.size;
+    if (have.has(id)) { skipped++; continue; }
+    $("musicHint").textContent = "Saving songs into the app: " + (k + 1) + " of " + files.length + "… keep the app open.";
+    try {
+      // Copy the bytes; a picked File can stop being readable once the picker's access ends.
+      const blob = storageOK ? new Blob([await f.arrayBuffer()], { type: mimeOf(f) }) : f;
+      if (storageOK) await idb("readwrite", st => { st.put({ id, name: songName(f), size: f.size, blob, added: Date.now() }); });
+      have.add(id); fresh.push({ id, name: songName(f), size: f.size, file: blob }); added++;
+    } catch (e) {
+      if (e && (e.name === "QuotaExceededError" || /quota/i.test(e.message || ""))) { full = true; break; }
+      failed++;
+    }
+    if (fresh.length >= 25) { setSongs([...songs, ...fresh]); fresh = []; } // show progress in the list
+  }
+  setSongs([...songs, ...fresh]);
+  importing = false;
   const favFound = songs.filter(isFav).length;
-  $("musicHint").textContent = songs.length + " songs loaded" + (music.favourites.length ? ", " + favFound + " of your " + music.favourites.length + " favourites among them." : ". Tap ☆ to star a favourite.");
+  $("musicHint").textContent = (full ? "The app's storage is full. " : "") + "Added " + added + " song" + (added === 1 ? "" : "s")
+    + (skipped ? ", " + skipped + " already in your library" : "") + (failed ? ", " + failed + " couldn't be read" : "")
+    + ". Library: " + songs.length + " songs, " + fmtSize(librarySize()) + "."
+    + (!storageOK ? " (Not saved: this browser blocks song storage.)" : music.favourites.length ? " " + favFound + " of your " + music.favourites.length + " favourites are in it." : "");
 }
-$("songs").addEventListener("change", e => { loadSongs(e.target.files); e.target.value = ""; });
+$("songs").addEventListener("change", e => { const fl = [...e.target.files]; e.target.value = ""; importSongs(fl); });
 $("bPlay").addEventListener("click", () => {
   if (!order.length) { $("songs").click(); return; }
   if (pos < 0) playAt(0); else if (audio.paused) audio.play().catch(() => {}); else audio.pause();
@@ -415,6 +500,23 @@ function renderLists() {
     if (n && !music.playlists[n]) { music.playlists[n] = []; saveMusic().catch(() => {}); renderLists(); }
   });
   box.append(f, el("p", "lhint", "To add songs, close this and tap ＋ next to a song in the list."));
+  // Library: what's stored in the app, and a way to empty it.
+  const lib = el("div", "lrow"), info = el("span", "lname");
+  info.style.cursor = "default";
+  info.textContent = storageOK ? "Library: " + songs.length + " songs, " + fmtSize(librarySize()) + " saved in this app" : "Songs aren't saved in this browser";
+  lib.append(info);
+  if (storageOK && navigator.storage && navigator.storage.estimate) navigator.storage.estimate().then(est => {
+    if (est.quota && est.usage != null) info.append(el("small", "", "about " + fmtSize(Math.max(0, est.quota - est.usage)) + " more room"));
+  }).catch(() => {});
+  if (songs.length) {
+    const clr = el("button", "danger", "Clear library"); clr.type = "button";
+    clr.addEventListener("click", () => {
+      if (!clr.dataset.armed) { clr.dataset.armed = "1"; clr.textContent = "Tap to delete all " + songs.length; return; }
+      clearLibrary();
+    });
+    lib.append(clr);
+  }
+  box.append(lib);
 }
 function showView() {
   $("bLists").setAttribute("aria-pressed", String(listsOpen));
@@ -444,8 +546,18 @@ function renderSheet() {
     opts.append(b);
   });
 }
-function openSheet(name) { sheetSong = name; $("sheetName").value = ""; renderSheet(); $("sheet").hidden = false; }
-function closeSheet() { $("sheet").hidden = true; sheetSong = null; }
+let sheetObj = null;
+function openSheet(s) {
+  sheetSong = s.name; sheetObj = s; $("sheetName").value = "";
+  const rm = $("sheetRemove"); delete rm.dataset.armed; rm.textContent = "Remove from library";
+  renderSheet(); $("sheet").hidden = false;
+}
+function closeSheet() { $("sheet").hidden = true; sheetSong = null; sheetObj = null; }
+$("sheetRemove").addEventListener("click", () => {
+  const rm = $("sheetRemove");
+  if (!rm.dataset.armed) { rm.dataset.armed = "1"; rm.textContent = "Tap again to remove “" + sheetSong + "”"; return; }
+  const s = sheetObj; closeSheet(); if (s) removeSong(s);
+});
 $("sheetDone").addEventListener("click", closeSheet);
 $("sheet").addEventListener("click", e => { if (e.target === $("sheet")) closeSheet(); });
 $("sheetNew").addEventListener("submit", e => {
@@ -642,6 +754,7 @@ audio.addEventListener("play", () => { if (kar) kar.ctx.resume().catch(() => {})
 function applyMusicSettings() { $("vol").value = music.volume; audio.volume = music.volume / 100; renderPlayer(); showLyrics(); showView(); }
 try { const m = JSON.parse(localStorage.getItem("music") || "null"); if (m) music = Object.assign(music, m); } catch (e) {}
 applyMusicSettings();
+loadLibrary();
 </script>
 
 <script>
